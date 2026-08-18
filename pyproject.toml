@@ -1,0 +1,11 @@
+[project]
+name = "mlx-cantonese"
+version = "0.1.0"
+description = "使用 MiniMax-Music3 在 MLX 上生成粵語獨白"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "mlx-audio>=0.5.0",
+    "numpy>=2.5.2",
+    "scipy>=1.18.0",
+]
