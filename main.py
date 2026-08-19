@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 
 import numpy as np
 from scipy.io import wavfile
@@ -17,20 +18,15 @@ MODEL_ID = "mlx-community/MiniMax-Music3-mxfp8"
 FRAME_RATE = 25.0  # 與套件 config.py 的 FRAME_RATE 一致，用來估算進度條總格數
 OUTPUT_FILENAME = "output/cantonese_monologue.wav"
 
-DURATION = 12  # 生成長度（秒）
+DURATION = 230  # 生成長度（秒）
 STEPS = 30     # 推論步數（1-30）
 SEED = 7
 
 # 風格設定（廣東話獨白、溫柔女聲、無背景音樂）
-STYLE_PROMPT = "Cantonese monologue, soft female vocal, clear speech, no background music"
+STYLE_PROMPT = ""
 
 # 歌詞/獨白文本（[Spoken] 標籤控制為說話而非唱歌）
-LYRICS = (
-    "[Spoken]\n"
-    "落雨嘅日子，總係會令人諗起好多過去嘅片段。\n"
-    "聽住雨聲，好似時間都慢落嚟一樣。\n"
-    "你，依家過得好嗎？"
-)
+LYRICS = """"""
 
 
 def _safe_patch(module, attr, make_wrapper) -> None:
@@ -59,18 +55,19 @@ def _attach_progress_bars(duration: float) -> None:
       ②Flow 解碼：_run_flow() 逐段呼叫 denoise_chunk() 把音框還原成波形。
     我們在每次呼叫時推進對應的 tqdm，並在階段切換時印提示。
 
-    注意打的模組不同：ar_one_frame 由 ar.py 內部呼叫 → 打 ar 模組；
-    denoise_chunk 是 `from .euler import denoise_chunk` 綁進 minimax_music3
-    的命名空間後由 _run_flow 呼叫 → 要打 minimax_music3 模組（打 euler 無效）。
+    打的模組不同：ar_one_frame 由 ar.py 內部呼叫 → 打 ar 模組；denoise_chunk 與
+    _chunk_starts 由 minimax_music3.py 的 _run_flow 呼叫（denoise_chunk 更是
+    `from .euler import` 綁進該命名空間）→ 都要打 minimax_music3 模組（打 euler 無效）。
     """
     import mlx_audio.music.models.minimax_music3.ar as ar_module
     import mlx_audio.music.models.minimax_music3.minimax_music3 as model_module
 
     total_frames = max(1, int(duration * FRAME_RATE)) + 1
 
-    # 用 nonlocal 閉包共享兩條進度條，避免 stringly-typed 的狀態字典。
+    # 用 nonlocal 閉包共享狀態，避免 stringly-typed 的狀態字典。
     ar_bar = None
     flow_bar = None
+    flow_total = None  # Flow 真實段數：從攔截 _chunk_starts 取得
 
     def make_ar_wrapper(original):
         def wrapped(*args, **kwargs):
@@ -80,7 +77,24 @@ def _attach_progress_bars(duration: float) -> None:
                     total=total_frames, desc="① 生成音框(自迴歸)", unit="frame"
                 )
             ar_bar.update(1)
-            return original(*args, **kwargs)
+            result = original(*args, **kwargs)
+            # 模型發出結束訊號(EOS)時內容已生成完，實際格數通常少於估算上限；
+            # 把總數校正為當前格數，讓進度條誠實顯示 100% 而非停在中途。
+            if getattr(result, "ended", False):
+                ar_bar.total = ar_bar.n
+                ar_bar.refresh()
+            return result
+
+        return wrapped
+
+    def make_chunk_starts_wrapper(original):
+        # _run_flow 開始時會呼叫一次 _chunk_starts(frame數) 決定要切幾多段；
+        # 攔截它就能在解碼開始前拿到確切段數，給 flow 進度條一個真實總數。
+        def wrapped(*args, **kwargs):
+            nonlocal flow_total
+            starts = original(*args, **kwargs)
+            flow_total = len(starts)
+            return starts
 
         return wrapped
 
@@ -95,15 +109,18 @@ def _attach_progress_bars(duration: float) -> None:
                     "\n自迴歸完成，進入 Flow 解碼階段（把音框還原成波形）...",
                     flush=True,
                 )
-                # chunk 總數依實際生成長度浮動，難以事前精算，故用 total=None：
-                # tqdm 會顯示「已完成段數 + 速率」而非百分比。
-                flow_bar = tqdm(desc="② Flow 解碼", unit="chunk")
+                # flow_total 由攔截 _chunk_starts 取得（真百分比條）；若攔截失敗
+                # 而為 None，tqdm 會退回「累計段數 + 速率」顯示，不會出錯。
+                flow_bar = tqdm(
+                    total=flow_total, desc="② Flow 解碼", unit="chunk"
+                )
             flow_bar.update(1)
             return original(*args, **kwargs)
 
         return wrapped
 
     _safe_patch(ar_module, "ar_one_frame", make_ar_wrapper)
+    _safe_patch(model_module, "_chunk_starts", make_chunk_starts_wrapper)
     _safe_patch(model_module, "denoise_chunk", make_flow_wrapper)
 
 
@@ -160,10 +177,54 @@ def _save_wav(result) -> None:
     print(f"生成成功！檔案已儲存至：{OUTPUT_FILENAME}", flush=True)
 
 
+def _format_duration(seconds: float) -> str:
+    """把秒數格式化成好讀的 'Hh Mm Ss'（只顯示需要的單位）。"""
+    minutes, secs = divmod(int(round(seconds)), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def _print_summary(result, load_elapsed, gen_elapsed, total_elapsed) -> None:
+    """印執行摘要：我們量到的實際牆鐘時間，加上模型自身回報的指標。"""
+    print("\n──────── 執行摘要 ────────", flush=True)
+    print(f"模型載入耗時：{_format_duration(load_elapsed)}", flush=True)
+    print(f"音訊生成耗時：{_format_duration(gen_elapsed)}", flush=True)
+    print(f"總計耗時：    {_format_duration(total_elapsed)}", flush=True)
+
+    # 以下來自 GenerationResult；用 getattr 防禦，套件改欄位也不會崩。
+    audio_duration = getattr(result, "audio_duration", None)
+    if audio_duration:
+        print(f"音訊長度：    {audio_duration}", flush=True)
+    token_count = getattr(result, "token_count", None)
+    if token_count is not None:
+        print(f"實際音框數：  {token_count}（自迴歸真正生成的格數）", flush=True)
+    rtf = getattr(result, "real_time_factor", None)
+    if rtf is not None:
+        print(f"實時比 RTF：  {rtf:.2f}×（<1 代表比實時快）", flush=True)
+    peak_memory = getattr(result, "peak_memory_usage", None)
+    if peak_memory is not None:
+        print(f"尖峰記憶體：  {peak_memory:.2f} GB", flush=True)
+
+
 def main() -> None:
+    overall_start = time.perf_counter()
+
+    load_start = time.perf_counter()
     model = _load_model()
+    load_elapsed = time.perf_counter() - load_start
+
+    gen_start = time.perf_counter()
     result = _generate_audio(model)
+    gen_elapsed = time.perf_counter() - gen_start
+
     _save_wav(result)
+    _print_summary(
+        result, load_elapsed, gen_elapsed, time.perf_counter() - overall_start
+    )
 
 
 if __name__ == "__main__":
